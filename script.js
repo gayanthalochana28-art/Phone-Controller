@@ -2,19 +2,18 @@
 let currentDeviceId = null;
 let targetDeviceId = null;
 let autoVibrate = false;
-let mediaStream = null;
+let cameraStream = null;
 let screenStream = null;
-let currentCamera = 'user';
-let peerConnection = null;
-let liveViewActive = false;
+let currentFacingMode = 'user';
+let remoteViewActive = false;
+let frameInterval = null;
 
-// Initialize on load
+// Initialize
 document.addEventListener('DOMContentLoaded', async () => {
     await initializeDevice();
-    setupEventListeners();
     setupFirebaseListeners();
     startSystemMonitoring();
-    addLog('✅ App initialized successfully!', 'success');
+    addLog('✅ App initialized! Set target device to start', 'success');
 });
 
 // Initialize device
@@ -34,9 +33,7 @@ async function initializeDevice() {
             id: currentDeviceId,
             status: 'online',
             lastSeen: Date.now(),
-            name: navigator.userAgent,
-            battery: 100,
-            signal: 'Good'
+            name: navigator.userAgent
         });
     }
     
@@ -45,24 +42,8 @@ async function initializeDevice() {
     if (savedTarget) {
         document.getElementById('targetDevice').value = savedTarget;
         targetDeviceId = savedTarget;
-        updateTargetStatus();
+        document.getElementById('targetStatus').innerHTML = `✅ Target: ${targetDeviceId}`;
     }
-}
-
-// Setup event listeners
-function setupEventListeners() {
-    document.getElementById('startScreenShare').addEventListener('click', startScreenShare);
-    document.getElementById('stopScreenShare').addEventListener('click', stopScreenShare);
-    document.getElementById('viewScreenShare').addEventListener('click', viewScreenShare);
-    document.getElementById('startCamera').addEventListener('click', startCamera);
-    document.getElementById('stopCamera').addEventListener('click', stopCamera);
-    document.getElementById('capturePhoto').addEventListener('click', capturePhoto);
-    document.getElementById('switchCamera').addEventListener('click', switchCamera);
-    document.getElementById('vibrateNow').addEventListener('click', () => sendVibrateCommand());
-    document.getElementById('toggleAutoVibe').addEventListener('click', toggleAutoVibrate);
-    document.getElementById('intensity').addEventListener('input', (e) => {
-        document.getElementById('intensityVal').textContent = e.target.value;
-    });
 }
 
 // Setup Firebase listeners
@@ -79,21 +60,21 @@ function setupFirebaseListeners() {
         }
     });
     
-    // Listen for screen share stream
+    // Listen for remote screen share
     const screenRef = window.dbRef(window.db, `streams/${currentDeviceId}/screen`);
     window.dbOnValue(screenRef, (snapshot) => {
         const data = snapshot.val();
-        if (data && data.active && data.sdp) {
-            handleRemoteStream(data);
+        if (data && data.image && remoteViewActive) {
+            displayRemoteStream(data.image);
         }
     });
     
-    // Listen for camera stream
+    // Listen for remote camera
     const cameraRef = window.dbRef(window.db, `streams/${currentDeviceId}/camera`);
     window.dbOnValue(cameraRef, (snapshot) => {
         const data = snapshot.val();
-        if (data && data.active && data.image) {
-            displayRemoteCamera(data.image);
+        if (data && data.image && remoteViewActive) {
+            displayRemoteStream(data.image);
         }
     });
 }
@@ -108,26 +89,23 @@ async function handleCommand(command) {
             break;
         case 'auto_vibrate':
             autoVibrate = command.enabled;
-            document.getElementById('toggleAutoVibe').innerHTML = 
+            document.getElementById('autoVibeBtn').innerHTML = 
                 `🔄 Auto-Vibrate: ${autoVibrate ? 'ON' : 'OFF'}`;
             break;
-        case 'start_screen_share':
-            await startReceivingScreenShare();
+        case 'request_camera':
+            startCameraAndStream();
             break;
-        case 'stop_screen_share':
-            stopReceivingScreenShare();
+        case 'request_screen':
+            startScreenShare();
             break;
-        case 'capture_photo':
-            await captureAndSendPhoto();
+        case 'photo':
+            displayReceivedPhoto(command.image);
             break;
         case 'play_video':
-            playRemoteVideo(command.url);
+            playVideoOnDevice(command.url);
             break;
         case 'notification':
             showNotification(command.message);
-            break;
-        case 'live_view_request':
-            startLiveViewStream();
             break;
     }
 }
@@ -155,183 +133,131 @@ async function sendCommand(command) {
     }
 }
 
-// Start Screen Share
-async function startScreenShare() {
-    try {
-        addLog('🎥 Starting screen share...', 'info');
-        
-        screenStream = await navigator.mediaDevices.getDisplayMedia({
-            video: { cursor: "always" },
-            audio: false
-        });
-        
-        const videoElement = document.getElementById('screenVideo');
-        videoElement.srcObject = screenStream;
-        document.getElementById('screenPlaceholder').style.display = 'none';
-        
-        // Capture and send frames
-        captureAndSendFrames(screenStream, 'screen');
-        
-        screenStream.getVideoTracks()[0].onended = () => {
-            stopScreenShare();
-        };
-        
-        await sendCommand({
-            type: 'start_screen_share',
-            from: currentDeviceId
-        });
-        
-        addLog('✅ Screen share started!', 'success');
-        
-    } catch(error) {
-        addLog(`❌ Screen share failed: ${error.message}`, 'error');
-    }
-}
-
-// Stop Screen Share
-function stopScreenShare() {
-    if (screenStream) {
-        screenStream.getTracks().forEach(track => track.stop());
-        screenStream = null;
-    }
-    
-    const videoElement = document.getElementById('screenVideo');
-    videoElement.srcObject = null;
-    document.getElementById('screenPlaceholder').style.display = 'flex';
-    
-    sendCommand({
-        type: 'stop_screen_share',
-        from: currentDeviceId
-    });
-    
-    addLog('⏹️ Screen share stopped', 'info');
-}
-
-// Capture and send frames periodically
-function captureAndSendFrames(stream, type) {
-    const video = document.createElement('video');
-    video.srcObject = stream;
-    video.play();
-    
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    
-    setInterval(() => {
-        if (video.videoWidth > 0) {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            ctx.drawImage(video, 0, 0);
-            
-            const imageData = canvas.toDataURL('image/jpeg', 0.3);
-            
-            // Send to Firebase
-            const streamRef = window.dbRef(window.db, `streams/${targetDeviceId}/${type}`);
-            window.dbSet(streamRef, {
-                active: true,
-                image: imageData,
-                timestamp: Date.now()
-            });
-        }
-    }, 500);
-}
-
-// Handle remote stream
-function handleRemoteStream(data) {
-    const videoElement = document.getElementById('screenVideo');
-    const placeholder = document.getElementById('screenPlaceholder');
-    
-    if (data.image) {
-        videoElement.src = data.image;
-        placeholder.style.display = 'none';
-        videoElement.style.display = 'block';
-    }
-}
-
-// View remote screen share
-function viewScreenShare() {
-    if (!targetDeviceId) {
-        alert('Please set target device first!');
-        return;
-    }
-    
-    addLog(`👁️ Viewing screen from ${targetDeviceId}`, 'info');
-    
-    const screenRef = window.dbRef(window.db, `streams/${targetDeviceId}/screen`);
-    window.dbOnValue(screenRef, (snapshot) => {
-        const data = snapshot.val();
-        if (data && data.image) {
-            const videoElement = document.getElementById('screenVideo');
-            videoElement.src = data.image;
-            document.getElementById('screenPlaceholder').style.display = 'none';
-            videoElement.style.display = 'block';
-            addLog('📺 Receiving screen share', 'success');
-        }
-    });
-}
-
-// Start Camera
+// ============ CAMERA FUNCTIONS - FIXED ============
 async function startCamera() {
+    addLog('📷 Starting camera...', 'info');
+    
     try {
-        addLog('📷 Starting camera...', 'info');
+        // Stop any existing stream
+        if (cameraStream) {
+            stopCamera();
+        }
         
         const constraints = {
-            video: { facingMode: currentCamera },
+            video: {
+                facingMode: { exact: currentFacingMode },
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            },
             audio: false
         };
         
-        mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+        cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
         
         const videoElement = document.getElementById('cameraVideo');
-        videoElement.srcObject = mediaStream;
-        document.getElementById('cameraPlaceholder').style.display = 'none';
+        videoElement.srcObject = cameraStream;
         
-        addLog('✅ Camera started!', 'success');
+        // Hide overlay
+        document.getElementById('cameraOverlay').style.display = 'none';
+        
+        // Update UI
+        document.getElementById('cameraStatus').innerHTML = 'Active';
+        document.getElementById('cameraStatus').style.background = '#4caf50';
+        document.getElementById('stopCameraBtn').disabled = false;
+        document.getElementById('captureBtn').disabled = false;
+        document.getElementById('switchCameraBtn').disabled = false;
+        document.getElementById('startCameraBtn').disabled = true;
+        
+        addLog('✅ Camera started successfully!', 'success');
+        
+        // Auto start streaming to target
+        startStreamingToTarget();
         
     } catch(error) {
         addLog(`❌ Camera error: ${error.message}`, 'error');
+        
+        // Try without facing mode constraint
+        try {
+            const simpleConstraints = { video: true, audio: false };
+            cameraStream = await navigator.mediaDevices.getUserMedia(simpleConstraints);
+            
+            const videoElement = document.getElementById('cameraVideo');
+            videoElement.srcObject = cameraStream;
+            document.getElementById('cameraOverlay').style.display = 'none';
+            
+            addLog('✅ Camera started (compatibility mode)!', 'success');
+            
+        } catch(e) {
+            addLog(`❌ Still failed: ${e.message}. Check permissions`, 'error');
+            alert('Camera access denied or not available. Please check permissions.');
+        }
     }
 }
 
-// Stop Camera
 function stopCamera() {
-    if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-        mediaStream = null;
+    addLog('⏹️ Stopping camera...', 'info');
+    
+    if (cameraStream) {
+        cameraStream.getTracks().forEach(track => track.stop());
+        cameraStream = null;
     }
     
     const videoElement = document.getElementById('cameraVideo');
     videoElement.srcObject = null;
-    document.getElementById('cameraPlaceholder').style.display = 'flex';
     
-    addLog('⏹️ Camera stopped', 'info');
+    // Show overlay
+    document.getElementById('cameraOverlay').style.display = 'flex';
+    
+    // Update UI
+    document.getElementById('cameraStatus').innerHTML = 'Inactive';
+    document.getElementById('cameraStatus').style.background = '#ff9800';
+    document.getElementById('stopCameraBtn').disabled = true;
+    document.getElementById('captureBtn').disabled = true;
+    document.getElementById('switchCameraBtn').disabled = true;
+    document.getElementById('startCameraBtn').disabled = false;
+    
+    // Stop streaming
+    if (frameInterval) {
+        clearInterval(frameInterval);
+        frameInterval = null;
+    }
+    
+    addLog('Camera stopped', 'info');
 }
 
-// Switch Camera
 function switchCamera() {
-    currentCamera = currentCamera === 'user' ? 'environment' : 'user';
-    stopCamera();
+    currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+    addLog(`🔄 Switching to ${currentFacingMode === 'user' ? 'front' : 'back'} camera...`, 'info');
     startCamera();
-    addLog(`🔄 Switched to ${currentCamera === 'user' ? 'front' : 'back'} camera`, 'info');
 }
 
-// Capture Photo
 function capturePhoto() {
+    if (!cameraStream) {
+        addLog('Camera not active!', 'error');
+        alert('Please start camera first');
+        return;
+    }
+    
     const video = document.getElementById('cameraVideo');
     const canvas = document.createElement('canvas');
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     
-    const photoData = canvas.toDataURL('image/jpeg');
+    const photoData = canvas.toDataURL('image/jpeg', 0.8);
     document.getElementById('capturedImage').src = photoData;
     document.getElementById('photoPreview').style.display = 'block';
     
     addLog('📸 Photo captured!', 'success');
 }
 
-// Send Photo to Target
 async function sendPhotoToTarget() {
     const photoData = document.getElementById('capturedImage').src;
+    if (!photoData || photoData === '') {
+        alert('No photo to send');
+        return;
+    }
     
     await sendCommand({
         type: 'photo',
@@ -342,70 +268,167 @@ async function sendPhotoToTarget() {
     addLog('📤 Photo sent to target!', 'success');
 }
 
-// Open Gallery
-function openGallery() {
-    document.getElementById('galleryInput').click();
+function closePreview() {
+    document.getElementById('photoPreview').style.display = 'none';
+}
+
+function displayReceivedPhoto(imageData) {
+    addLog('📸 Received photo from target', 'info');
     
-    document.getElementById('galleryInput').onchange = (e) => {
-        const files = Array.from(e.target.files);
-        const preview = document.getElementById('galleryPreview');
-        preview.innerHTML = '';
-        
-        files.forEach(file => {
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                const div = document.createElement('div');
-                div.className = 'gallery-item';
+    // Show notification
+    const preview = document.getElementById('photoPreview');
+    document.getElementById('capturedImage').src = imageData;
+    preview.style.display = 'block';
+    
+    // Also show in log
+    addLog('Photo received! Check preview above', 'success');
+}
+
+// Start streaming camera to target
+function startStreamingToTarget() {
+    if (frameInterval) {
+        clearInterval(frameInterval);
+    }
+    
+    frameInterval = setInterval(() => {
+        if (cameraStream && targetDeviceId) {
+            const video = document.getElementById('cameraVideo');
+            if (video.videoWidth > 0) {
+                const canvas = document.createElement('canvas');
+                canvas.width = 640; // Resize for performance
+                canvas.height = 360;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                 
-                if (file.type.startsWith('image/')) {
-                    const img = document.createElement('img');
-                    img.src = event.target.result;
-                    div.appendChild(img);
-                } else if (file.type.startsWith('video/')) {
-                    const video = document.createElement('video');
-                    video.src = event.target.result;
-                    video.controls = true;
-                    div.appendChild(video);
-                }
+                const imageData = canvas.toDataURL('image/jpeg', 0.5);
                 
-                preview.appendChild(div);
-            };
-            reader.readAsDataURL(file);
+                const streamRef = window.dbRef(window.db, `streams/${targetDeviceId}/camera`);
+                window.dbSet(streamRef, {
+                    active: true,
+                    image: imageData,
+                    timestamp: Date.now(),
+                    from: currentDeviceId
+                });
+            }
+        }
+    }, 500); // 2 frames per second
+}
+
+// ============ SCREEN SHARE FUNCTIONS ============
+async function startScreenShare() {
+    addLog('🖥️ Starting screen share...', 'info');
+    
+    try {
+        screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { cursor: "always" },
+            audio: false
         });
         
-        addLog(`📁 ${files.length} file(s) loaded from gallery`, 'success');
-    };
+        const videoElement = document.getElementById('screenVideo');
+        videoElement.srcObject = screenStream;
+        document.getElementById('screenOverlay').style.display = 'none';
+        
+        document.getElementById('stopScreenShareBtn').disabled = false;
+        document.getElementById('startScreenShareBtn').disabled = true;
+        
+        // Start streaming screen frames
+        startScreenStreaming();
+        
+        screenStream.getVideoTracks()[0].onended = () => {
+            stopScreenShare();
+        };
+        
+        addLog('✅ Screen share started!', 'success');
+        
+    } catch(error) {
+        addLog(`❌ Screen share failed: ${error.message}`, 'error');
+    }
 }
 
-// Capture from camera (for gallery)
-function captureFromCamera() {
-    startCamera();
-    setTimeout(() => {
-        capturePhoto();
-    }, 1000);
+function stopScreenShare() {
+    addLog('⏹️ Stopping screen share...', 'info');
+    
+    if (screenStream) {
+        screenStream.getTracks().forEach(track => track.stop());
+        screenStream = null;
+    }
+    
+    const videoElement = document.getElementById('screenVideo');
+    videoElement.srcObject = null;
+    document.getElementById('screenOverlay').style.display = 'flex';
+    
+    document.getElementById('stopScreenShareBtn').disabled = true;
+    document.getElementById('startScreenShareBtn').disabled = false;
+    
+    addLog('Screen share stopped', 'info');
 }
 
-// Share Media to Target
-async function shareMedia() {
-    const mediaItems = document.querySelectorAll('.gallery-item img, .gallery-item video');
-    if (mediaItems.length === 0) {
-        alert('No media selected');
+function startScreenStreaming() {
+    if (frameInterval) {
+        clearInterval(frameInterval);
+    }
+    
+    frameInterval = setInterval(() => {
+        if (screenStream && targetDeviceId) {
+            const video = document.getElementById('screenVideo');
+            if (video.videoWidth > 0) {
+                const canvas = document.createElement('canvas');
+                canvas.width = 640;
+                canvas.height = 360;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                const imageData = canvas.toDataURL('image/jpeg', 0.5);
+                
+                const streamRef = window.dbRef(window.db, `streams/${targetDeviceId}/screen`);
+                window.dbSet(streamRef, {
+                    active: true,
+                    image: imageData,
+                    timestamp: Date.now(),
+                    from: currentDeviceId
+                });
+            }
+        }
+    }, 500);
+}
+
+function viewRemoteScreen() {
+    if (!targetDeviceId) {
+        alert('Please set target device first!');
         return;
     }
     
-    for (let item of mediaItems) {
-        await sendCommand({
-            type: 'media',
-            src: item.src,
-            from: currentDeviceId
-        });
-    }
-    
-    addLog(`📤 ${mediaItems.length} media item(s) shared`, 'success');
+    startRemoteView();
+    addLog(`👁️ Viewing screen from ${targetDeviceId}`, 'info');
 }
 
-// Send vibrate command
-async function sendVibrateCommand() {
+// ============ REMOTE VIEW FUNCTIONS ============
+function startRemoteView() {
+    if (!targetDeviceId) {
+        alert('Please set target device first!');
+        return;
+    }
+    
+    remoteViewActive = true;
+    document.getElementById('remoteOverlay').style.display = 'none';
+    addLog('📡 Remote view started', 'success');
+}
+
+function stopRemoteView() {
+    remoteViewActive = false;
+    document.getElementById('remoteOverlay').style.display = 'flex';
+    const video = document.getElementById('remoteVideo');
+    video.src = '';
+    addLog('⏹️ Remote view stopped', 'info');
+}
+
+function displayRemoteStream(imageData) {
+    const video = document.getElementById('remoteVideo');
+    video.src = imageData;
+}
+
+// ============ VIBRATION FUNCTIONS ============
+async function sendVibrate() {
     const intensity = document.getElementById('intensity').value;
     const pattern = document.getElementById('vibePattern').value;
     
@@ -415,12 +438,12 @@ async function sendVibrateCommand() {
         pattern: pattern
     });
     
+    // Preview locally
     executeVibration(intensity, pattern);
 }
 
-// Execute vibration
 function executeVibration(intensity, pattern) {
-    addLog(`📳 Vibrating: ${pattern} at ${intensity}%`, 'vibrate');
+    addLog(`📳 Vibrating: ${pattern}`, 'vibrate');
     
     if ('vibrate' in navigator) {
         let patternArray = [];
@@ -436,10 +459,10 @@ function executeVibration(intensity, pattern) {
                 patternArray = [100];
                 break;
             case 'heartbeat':
-                patternArray = [200, 100, 200, 300, 400, 200];
+                patternArray = [200, 100, 200];
                 break;
             case 'sos':
-                patternArray = [100, 100, 100, 100, 100, 100, 300, 300, 300, 100, 100, 100];
+                patternArray = [100, 100, 100, 500, 500, 500, 100, 100, 100];
                 break;
             default:
                 patternArray = [300];
@@ -453,11 +476,10 @@ function executeVibration(intensity, pattern) {
     }
 }
 
-// Toggle auto vibrate
 async function toggleAutoVibrate() {
     autoVibrate = !autoVibrate;
-    document.getElementById('toggleAutoVibe').innerHTML = 
-        `🔄 Auto-Vibrate: ${autoVibrate ? 'ON' : 'OFF'}`;
+    const btn = document.getElementById('autoVibeBtn');
+    btn.innerHTML = `🔄 Auto-Vibrate: ${autoVibrate ? 'ON' : 'OFF'}`;
     
     await sendCommand({
         type: 'auto_vibrate',
@@ -465,32 +487,47 @@ async function toggleAutoVibrate() {
     });
 }
 
-// Play remote video
-function playRemoteVideo() {
+// ============ VIDEO & NOTIFICATION ============
+async function sendVideoToTarget() {
     const url = document.getElementById('videoUrl').value;
     if (!url) {
         alert('Enter video URL');
         return;
     }
     
-    sendCommand({
+    await sendCommand({
         type: 'play_video',
         url: url
     });
     
-    addLog(`▶️ Playing video on target: ${url}`, 'info');
+    addLog(`▶️ Video sent to target: ${url}`, 'success');
 }
 
-function playRemoteVideo(url) {
-    const video = document.getElementById('localVideo');
-    video.style.display = 'block';
+function playVideoOnDevice(url) {
+    const video = document.createElement('video');
     video.src = url;
-    video.play();
-    addLog(`🎬 Playing video`, 'info');
+    video.controls = true;
+    video.autoplay = true;
+    video.style.position = 'fixed';
+    video.style.bottom = '20px';
+    video.style.right = '20px';
+    video.style.width = '300px';
+    video.style.zIndex = '9999';
+    video.style.borderRadius = '12px';
+    video.style.boxShadow = '0 5px 20px rgba(0,0,0,0.3)';
+    
+    document.body.appendChild(video);
+    
+    setTimeout(() => {
+        if (video && !video.paused) {
+            video.remove();
+        }
+    }, 30000);
+    
+    addLog('🎬 Playing video', 'info');
 }
 
-// Send notification
-async function sendNotification() {
+async function sendNotificationToTarget() {
     const message = document.getElementById('notificationMsg').value;
     if (!message) {
         alert('Enter message');
@@ -503,6 +540,7 @@ async function sendNotification() {
     });
     
     addLog(`🔔 Notification sent: ${message}`, 'success');
+    document.getElementById('notificationMsg').value = '';
 }
 
 function showNotification(message) {
@@ -512,145 +550,57 @@ function showNotification(message) {
     addLog(`🔔 Notification: ${message}`, 'info');
 }
 
-// Start live view
-function startLiveView() {
-    if (!targetDeviceId) {
-        alert('Set target device first');
-        return;
-    }
-    
-    liveViewActive = true;
-    sendCommand({
-        type: 'live_view_request',
-        from: currentDeviceId
-    });
-    
-    // Listen for live stream
-    const liveRef = window.dbRef(window.db, `streams/${targetDeviceId}/live`);
-    window.dbOnValue(liveRef, (snapshot) => {
-        const data = snapshot.val();
-        if (data && data.image && liveViewActive) {
-            const video = document.getElementById('liveVideo');
-            video.src = data.image;
-            document.getElementById('livePlaceholder').style.display = 'none';
-        }
-    });
-    
-    addLog('📡 Live view started', 'success');
-}
-
-function stopLiveView() {
-    liveViewActive = false;
-    document.getElementById('livePlaceholder').style.display = 'flex';
-    addLog('⏹️ Live view stopped', 'info');
-}
-
-function startLiveViewStream() {
-    if (mediaStream) {
-        captureAndSendFrames(mediaStream, 'live');
-    } else {
-        startCamera();
-        setTimeout(() => {
-            captureAndSendFrames(mediaStream, 'live');
-        }, 1000);
-    }
-}
-
-// System Monitoring
-async function startSystemMonitoring() {
-    // Battery monitoring
-    if ('getBattery' in navigator) {
-        const battery = await navigator.getBattery();
-        updateBatteryStatus(battery);
-        
-        battery.addEventListener('levelchange', () => updateBatteryStatus(battery));
-        battery.addEventListener('chargingchange', () => updateBatteryStatus(battery));
-    }
-    
-    // Signal strength simulation
-    setInterval(() => {
-        const signals = ['Excellent', 'Good', 'Fair', 'Poor'];
-        const randomSignal = signals[Math.floor(Math.random() * signals.length)];
-        document.getElementById('signalStrength').textContent = randomSignal;
-    }, 5000);
-    
-    // Time update
-    setInterval(() => {
-        const now = new Date();
-        document.getElementById('currentTime').textContent = now.toLocaleTimeString();
-    }, 1000);
-    
-    // Storage info
-    if ('storage' in navigator && 'estimate' in navigator.storage) {
-        const estimate = await navigator.storage.estimate();
-        const used = (estimate.usage / (1024 * 1024)).toFixed(0);
-        const total = (estimate.quota / (1024 * 1024)).toFixed(0);
-        document.getElementById('storageStatus').textContent = `${used}MB/${total}MB`;
-    }
-}
-
-function updateBatteryStatus(battery) {
-    const level = Math.round(battery.level * 100);
-    const charging = battery.charging ? '⚡' : '🔋';
-    document.getElementById('batteryLevel').innerHTML = `${charging} ${level}%`;
-}
-
-// Set target device
+// ============ UTILITY FUNCTIONS ============
 function setTargetDevice() {
     const target = document.getElementById('targetDevice').value;
     if (target && target !== currentDeviceId) {
         targetDeviceId = target;
         localStorage.setItem('targetDevice', targetDeviceId);
-        updateTargetStatus();
-        addLog(`🎯 Target set: ${targetDeviceId}`, 'success');
+        document.getElementById('targetStatus').innerHTML = `✅ Target set to: ${targetDeviceId}`;
+        document.getElementById('targetStatus').style.background = '#e8f5e9';
+        document.getElementById('targetStatus').style.padding = '8px';
+        document.getElementById('targetStatus').style.borderRadius = '8px';
+        addLog(`🎯 Target device set: ${targetDeviceId}`, 'success');
     } else if (target === currentDeviceId) {
         alert('Cannot target yourself!');
     } else {
-        alert('Enter valid device ID');
+        alert('Please enter a valid device ID');
     }
 }
 
-function updateTargetStatus() {
-    const statusDiv = document.getElementById('targetStatus');
-    statusDiv.innerHTML = `✅ Target: ${targetDeviceId}`;
-    statusDiv.style.background = '#e8f5e9';
-    statusDiv.style.padding = '8px';
-    statusDiv.style.borderRadius = '8px';
-}
-
-// Switch tabs
-function switchTab(tab) {
-    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    
-    document.getElementById(`${tab}Tab`).classList.add('active');
-    event.target.classList.add('active');
-}
-
-// Copy device ID
 function copyDeviceId() {
     navigator.clipboard.writeText(currentDeviceId);
     addLog('📋 Device ID copied!', 'success');
-    alert('Device ID copied!');
+    alert('Device ID copied: ' + currentDeviceId);
 }
 
-// Capture live frame
-function captureLiveFrame() {
-    const video = document.getElementById('liveVideo');
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);
+// System monitoring
+async function startSystemMonitoring() {
+    // Battery
+    if ('getBattery' in navigator) {
+        const battery = await navigator.getBattery();
+        updateBattery(battery);
+        battery.addEventListener('levelchange', () => updateBattery(battery));
+    }
     
-    const link = document.createElement('a');
-    link.download = `frame_${Date.now()}.png`;
-    link.href = canvas.toDataURL();
-    link.click();
+    // Time
+    setInterval(() => {
+        document.getElementById('currentTime').textContent = new Date().toLocaleTimeString();
+    }, 1000);
     
-    addLog('📸 Frame captured', 'success');
+    // Signal simulation
+    setInterval(() => {
+        const signals = ['Excellent', 'Good', 'Fair'];
+        document.getElementById('signalStrength').textContent = signals[Math.floor(Math.random() * signals.length)];
+    }, 5000);
 }
 
-// Add log
+function updateBattery(battery) {
+    const level = Math.round(battery.level * 100);
+    document.getElementById('batteryLevel').textContent = `${level}%`;
+}
+
+// Add log message
 function addLog(message, type = 'info') {
     const logContainer = document.getElementById('logMessages');
     const logEntry = document.createElement('div');
@@ -660,14 +610,12 @@ function addLog(message, type = 'info') {
         success: '#4caf50',
         error: '#f44336',
         info: '#2196f3',
-        vibrate: '#ff9800',
-        warning: '#ffc107'
+        vibrate: '#ff9800'
     };
     
     logEntry.style.color = colors[type] || '#333';
-    logEntry.style.padding = '4px';
-    logEntry.style.borderLeft = `3px solid ${colors[type] || '#333'}`;
-    logEntry.style.marginBottom = '4px';
+    logEntry.style.padding = '5px';
+    logEntry.style.borderBottom = '1px solid #e0e0e0';
     logEntry.innerHTML = `[${timestamp}] ${message}`;
     logContainer.appendChild(logEntry);
     logContainer.scrollTop = logContainer.scrollHeight;
@@ -678,54 +626,17 @@ function clearLog() {
     addLog('Log cleared', 'info');
 }
 
-// Display remote camera
-function displayRemoteCamera(imageData) {
-    const img = document.createElement('img');
-    img.src = imageData;
-    document.getElementById('galleryPreview').appendChild(img);
-}
-
-// Capture and send photo
-async function captureAndSendPhoto() {
-    if (mediaStream) {
-        capturePhoto();
-        setTimeout(() => sendPhotoToTarget(), 500);
-    }
-}
-
-// Start receiving screen share
-async function startReceivingScreenShare() {
-    addLog('📺 Preparing to receive screen share...', 'info');
-    const screenRef = window.dbRef(window.db, `streams/${currentDeviceId}/screen`);
-    window.dbOnValue(screenRef, (snapshot) => {
-        const data = snapshot.val();
-        if (data && data.image) {
-            const videoElement = document.getElementById('screenVideo');
-            videoElement.src = data.image;
-            document.getElementById('screenPlaceholder').style.display = 'none';
-        }
-    });
-}
-
-function stopReceivingScreenShare() {
-    addLog('⏹️ Screen share ended', 'info');
-    document.getElementById('screenPlaceholder').style.display = 'flex';
-}
-
 // Request notification permission
 if ('Notification' in window) {
     Notification.requestPermission();
 }
 
-// Handle page unload
-window.addEventListener('beforeunload', async () => {
-    if (screenStream) screenStream.getTracks().forEach(t => t.stop());
-    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-    
-    if (currentDeviceId && window.dbSet) {
-        const deviceRef = window.dbRef(window.db, `devices/${currentDeviceId}`);
-        await window.dbSet(deviceRef, { status: 'offline', lastSeen: Date.now() });
+// Cleanup on page unload
+window.addEventListener('beforeunload', () => {
+    if (cameraStream) {
+        cameraStream.getTracks().forEach(t => t.stop());
+    }
+    if (screenStream) {
+        screenStream.getTracks().forEach(t => t.stop());
     }
 });
-
-addLog('🎉 App ready! Set target device to start', 'success');
